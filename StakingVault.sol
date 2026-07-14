@@ -1,200 +1,212 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+// Импортируем проверенные контракты безопасности от OpenZeppelin
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract StakingVault is Ownable, AccessControl, Pausable, ReentrancyGuard {
+contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+
+
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
 
     IERC20 public immutable stakingToken;
-    uint256 public minStakeAmount = 10 * 10**18; 
-    uint256 public baseRewardRate = 100; 
+
+    uint256 public rewardRate = 100; 
+    uint256 public minStakeAmount = 10 * 10**18;
+
+    uint256 constant REWARD_INTERVAL = 60 seconds; 
+    uint256 constant UNSTAKE_COOLDOWN = 5 minutes; 
+
+
+
     enum UserTier { Bronze, Silver, Gold, Diamond }
 
     struct UserInfo {
-        uint256 stakedAmount;
-        uint256 startTime;
-        uint256 lastClaimTime;
-        uint256 totalRewardsClaimed;
+        uint256 amount;
+        uint256 depositTime;
+        uint256 lastClaimTime;    
+        uint256 totalRewardsClaimed; 
         uint256 lockDuration;
-        uint256 unlockTime;
+        uint256 lockUntil;
+        bool hasActiveStake;
     }
 
+
+    struct GlobalStats {
+        uint256 totalUsers;
+        uint256 totalTokensStaked;
+        uint256 totalTokensWithdrawn;
+        uint256 totalRewardsPaid;
+        uint256 stakeOperations;
+        uint256 unstakeOperations;
+        uint256 claimOperations;
+    }
+
+    GlobalStats public stats;
+
     mapping(address => UserInfo) public users;
-    uint256 public totalUsers;
-    uint256 public totalStaked;
-    uint256 public totalUnstaked;
-    uint256 public totalRewardsPaid;
-    uint256 public stakeCount;
-    uint256 public unstakeCount;
-    uint256 public claimCount;
+    
+    address[] private userAddresses;
+    mapping(address => bool) private hasRegisteredAddress;
 
-    mapping(address => bool) private hasStakedBefore;
-    event StakeCreated(address indexed user, uint256 amount, uint256 lockDays);
-    event StakeIncreased(address indexed user, uint256 amount);
+    event Staked(address indexed user, uint256 amount, uint256 lockDuration);
+    event StakeIncreased(address indexed user, uint256 additionalAmount);
     event Unstaked(address indexed user, uint256 amount);
-    event RewardClaimed(address indexed user, uint256 amount);
-    event ContractPaused(address indexed admin);
-    event ContractUnpaused(address indexed admin);
-    event MinStakeChanged(uint256 oldValue, uint256 newValue);
-    event RewardRateChanged(uint256 oldValue, uint256 newValue);
-    event RoleGrantedCustom(bytes32 indexed role, address indexed account);
-    event RoleRevokedCustom(bytes32 indexed role, address indexed account);
+    event RewardClaimed(address indexed user, uint256 rewardAmount);
+    event ContractPaused(address account);
+    event ContractUnpaused(address account);
+    event ConfigChanged(string param, uint256 newValue);
+    event RoleGrantedCustom(bytes32 indexed role, address indexed account, address indexed sender);
+    event RoleRevokedCustom(bytes32 indexed role, address indexed account, address indexed sender);
 
-    constructor(address _tokenAddress) Ownable(msg.sender) {
-        require(_tokenAddress != address(0), "Invalid token address");
-        stakingToken = IERC20(_tokenAddress);
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+
+    constructor(address _stakingToken) Ownable(msg.sender) {
+        stakingToken = IERC20(_stakingToken);
+
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender); 
         _grantRole(ADMIN_ROLE, msg.sender);
         _grantRole(AUDITOR_ROLE, msg.sender);
     }
+
 
     function stake(uint256 _amount, uint256 _lockDays) external whenNotPaused nonReentrant {
         require(_amount > 0, "Cannot stake 0 tokens");
         
         UserInfo storage user = users[msg.sender];
 
-        if (user.stakedAmount == 0) {
-            require(_amount >= minStakeAmount, "Amount below minimum stake");
-            require(_lockDays == 7 || _lockDays == 30 || _lockDays == 90, "Invalid lock duration");
+        if (!user.hasActiveStake) {
+            require(_amount >= minStakeAmount, "Amount below minimum limit");
+            require(_lockDays == 0 || _lockDays == 7 || _lockDays == 30 || _lockDays == 90, "Invalid lock duration");
 
-            user.stakedAmount = _amount;
-            user.startTime = block.timestamp;
+            user.amount = _amount;
+            user.depositTime = block.timestamp;
             user.lastClaimTime = block.timestamp;
             user.lockDuration = _lockDays * 1 days;
-            user.unlockTime = block.timestamp + user.lockDuration;
-            if (!hasStakedBefore[msg.sender]) {
-                hasStakedBefore[msg.sender] = true;
-                totalUsers++;
+            user.lockUntil = block.timestamp + (_lockDays * 1 days);
+            user.hasActiveStake = true;
+
+            if (!hasRegisteredAddress[msg.sender]) {
+                hasRegisteredAddress[msg.sender] = true;
+                userAddresses.push(msg.sender);
+                stats.totalUsers++;
             }
 
-            emit StakeCreated(msg.sender, _amount, _lockDays);
+            emit Staked(msg.sender, _amount, _lockDays);
         } else {
-            uint256 pending = calculateReward(msg.sender);
-            if (pending > 0) {
-                user.totalRewardsClaimed += pending;
-                totalRewardsPaid += pending;
-                stakingToken.safeTransfer(msg.sender, pending);
-                emit RewardClaimed(msg.sender, pending);
-                claimCount++;
-            }
+            require(_lockDays == 0, "Cannot change lock period on additional stake");
+            
+            _claimReward(msg.sender);
 
-            user.stakedAmount += _amount;
-            user.lastClaimTime = block.timestamp;
+            user.amount += _amount;
+            if (user.lockDuration > 0) {
+                user.lockUntil = block.timestamp + user.lockDuration;
+            }
 
             emit StakeIncreased(msg.sender, _amount);
         }
 
-        totalStaked += _amount;
-        stakeCount++;
+        stats.totalTokensStaked += _amount;
+        stats.stakeOperations++;
+
         stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
     }
 
     function unstake(uint256 _amount) external whenNotPaused nonReentrant {
         UserInfo storage user = users[msg.sender];
-
-        require(_amount > 0, "Cannot unstake 0");
-        require(user.stakedAmount >= _amount, "Not enough staked balance");
-        require(block.timestamp >= user.unlockTime, "Tokens are still locked");
-        require(block.timestamp >= user.lastClaimTime + 5 minutes, "Allowed once in 5 minutes");
-
-        uint256 pending = calculateReward(msg.sender);
         
-        user.stakedAmount -= _amount;
-        user.lastClaimTime = block.timestamp;
+        require(user.hasActiveStake, "No active stake found");
+        require(_amount > 0, "Cannot withdraw 0");
+        require(user.amount >= _amount, "Insufficient staked balance");
+        require(block.timestamp >= user.lockUntil, "Tokens are still locked");
+        require(block.timestamp >= user.lastClaimTime + UNSTAKE_COOLDOWN, "Withdraw cooldown active (5 mins)");
 
-        uint256 totalToTransfer = _amount;
-        if (pending > 0) {
-            user.totalRewardsClaimed += pending;
-            totalRewardsPaid += pending;
-            totalToTransfer += pending;
-            emit RewardClaimed(msg.sender, pending);
-            claimCount++;
-        }
+        _claimReward(msg.sender);
 
-        totalUnstaked += _amount;
-        unstakeCount++;
+        user.amount -= _amount;
+        stats.totalTokensWithdrawn += _amount;
+        stats.unstakeOperations++;
 
-        if (user.stakedAmount == 0) {
-            user.startTime = 0;
-            user.unlockTime = 0;
+        if (user.amount == 0) {
+            user.hasActiveStake = false;
+            user.lockUntil = 0;
             user.lockDuration = 0;
         }
 
         emit Unstaked(msg.sender, _amount);
-        
-        stakingToken.safeTransfer(msg.sender, totalToTransfer);
+
+        stakingToken.safeTransfer(msg.sender, _amount);
     }
 
     function claimReward() external whenNotPaused nonReentrant {
-        UserInfo storage user = users[msg.sender];
-        require(user.stakedAmount > 0, "No active stake");
-
-        uint256 pending = calculateReward(msg.sender);
-        require(pending > 0, "No rewards accrued");
-
-        user.lastClaimTime = block.timestamp;
-        user.totalRewardsClaimed += pending;
-        totalRewardsPaid += pending;
-        claimCount++;
-
-        emit RewardClaimed(msg.sender, pending);
-
-        stakingToken.safeTransfer(msg.sender, pending);
+        require(users[msg.sender].hasActiveStake, "No active stake");
+        _claimReward(msg.sender);
     }
 
 
-    function getUserTier(address _user) public view returns (UserTier) {
-        uint256 amount = users[_user].stakedAmount / 10**18; 
-        if (amount >= 1000) return UserTier.Diamond;
-        if (amount >= 500) return UserTier.Gold;
-        if (amount >= 100) return UserTier.Silver;
-        return UserTier.Bronze;
+    function _claimReward(address _userAddress) internal {
+        UserInfo storage user = users[_userAddress];
+        
+        uint256 reward = calculateReward(_userAddress);
+        
+        if (reward > 0) {
+            user.totalRewardsClaimed += reward;
+            stats.totalRewardsPaid += reward;
+            stats.claimOperations++;
+            
+            user.lastClaimTime = block.timestamp;
+
+            emit RewardClaimed(_userAddress, reward);
+
+            stakingToken.safeTransfer(_userAddress, reward);
+        } else {
+            user.lastClaimTime = block.timestamp;
+        }
     }
-    function calculateReward(address _user) public view returns (uint256) {
-        UserInfo memory user = users[_user];
-        if (user.stakedAmount == 0) return 0;
+
+    function calculateReward(address _userAddress) public view returns (uint256) {
+        UserInfo memory user = users[_userAddress];
+        if (!user.hasActiveStake) return 0;
+
         uint256 timePassed = block.timestamp - user.lastClaimTime;
-        uint256 minutesPassed = timePassed / 60; 
+        uint256 periods = timePassed / REWARD_INTERVAL; 
+        
+        if (periods == 0) return 0;
 
-        if (minutesPassed == 0) return 0;
+        uint256 baseReward = (user.amount * periods * rewardRate) / 10000;
+        UserTier tier = getUserTier(_userAddress);
+        uint256 tierMultiplier = 100; 
+        if (tier == UserTier.Silver) tierMultiplier = 110; 
+        else if (tier == UserTier.Gold) tierMultiplier = 125;   
+        else if (tier == UserTier.Diamond) tierMultiplier = 150;
 
-        uint256 tierMultiplier = 100;
-        UserTier tier = getUserTier(_user);
-        if (tier == UserTier.Silver) tierMultiplier = 120;
-        if (tier == UserTier.Gold) tierMultiplier = 150;  
-        if (tier == UserTier.Diamond) tierMultiplier = 200; 
+        baseReward = (baseReward * tierMultiplier) / 100;
+
 
         uint256 lockMultiplier = 100;
-        if (user.lockDuration == 7 days) lockMultiplier = 110;  
-        if (user.lockDuration == 30 days) lockMultiplier = 130; 
-        if (user.lockDuration == 90 days) lockMultiplier = 160; 
+        if (user.lockDuration == 7 days) lockMultiplier = 120;   
+        else if (user.lockDuration == 30 days) lockMultiplier = 150; 
+        else if (user.lockDuration == 90 days) lockMultiplier = 200; 
 
+        return (baseReward * lockMultiplier) / 100;
+    }
 
-        uint256 reward = (user.stakedAmount * baseRewardRate * minutesPassed * tierMultiplier * lockMultiplier) / (10000 * 10000);
+    function getUserTier(address _userAddress) public view returns (UserTier) {
+        uint256 amount = users[_userAddress].amount;
         
-        return reward;
+        if (amount >= 1000 * 10**18) return UserTier.Diamond;
+        if (amount >= 500 * 10**18) return UserTier.Gold;
+        if (amount >= 100 * 10**18) return UserTier.Silver;
+        return UserTier.Bronze;
     }
 
-
-    function setMinStakeAmount(uint256 _newMin) external onlyRole(ADMIN_ROLE) {
-        uint256 old = minStakeAmount;
-        minStakeAmount = _newMin;
-        emit MinStakeChanged(old, _newMin);
-    }
-
-    function setBaseRewardRate(uint256 _newRate) external onlyRole(ADMIN_ROLE) {
-        uint256 old = baseRewardRate;
-        baseRewardRate = _newRate;
-        emit RewardRateChanged(old, _newRate);
-    }
 
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
@@ -206,24 +218,35 @@ contract StakingVault is Ownable, AccessControl, Pausable, ReentrancyGuard {
         emit ContractUnpaused(msg.sender);
     }
 
-    function customGrantRole(bytes32 _role, address _account) external onlyRole(ADMIN_ROLE) {
-        grantRole(_role, _account);
-        emit RoleGrantedCustom(_role, _account);
+    function setMinStakeAmount(uint256 _newMin) external onlyRole(ADMIN_ROLE) {
+        minStakeAmount = _newMin;
+        emit ConfigChanged("minStakeAmount", _newMin);
     }
 
-    function customRevokeRole(bytes32 _role, address _account) external onlyRole(ADMIN_ROLE) {
-        revokeRole(_role, _account);
-        emit RoleRevokedCustom(_role, _account);
+    function setRewardRate(uint256 _newRate) external onlyRole(ADMIN_ROLE) {
+        rewardRate = _newRate;
+        emit ConfigChanged("rewardRate", _newRate);
     }
 
-    function getFullUserInfo(address _user) external view onlyRole(AUDITOR_ROLE) returns (UserInfo memory) {
-        return users[_user];
+    function grantRoleCustom(bytes32 _role, address _account) external onlyRole(ADMIN_ROLE) {
+        _grantRole(_role, _account);
+        emit RoleGrantedCustom(_role, _account, msg.sender);
     }
 
-    function getGlobalStats() external view onlyRole(AUDITOR_ROLE) returns (
-        uint256 _totalUsers, uint256 _totalStaked, uint256 _totalUnstaked, 
-        uint256 _totalRewardsPaid, uint256 _stakeCount, uint256 _unstakeCount, uint256 _claimCount
-    ) {
-        return (totalUsers, totalStaked, totalUnstaked, totalRewardsPaid, stakeCount, unstakeCount, claimCount);
+    function revokeRoleCustom(bytes32 _role, address _account) external onlyRole(ADMIN_ROLE) {
+        _revokeRole(_role, _account);
+        emit RoleRevokedCustom(_role, _account, msg.sender);
+    }
+
+    function getPlayerStats(address _userAddress) external view onlyRole(AUDITOR_ROLE) returns (UserInfo memory) {
+        return users[_userAddress];
+    }
+
+    function getAllPlayers() external view onlyRole(AUDITOR_ROLE) returns (address[] memory) {
+        return userAddresses;
+    }
+
+    function getGlobalStats() external view onlyRole(AUDITOR_ROLE) returns (GlobalStats memory) {
+        return stats;
     }
 }
