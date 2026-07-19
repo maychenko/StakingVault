@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// Импортируем проверенные контракты безопасности от OpenZeppelin
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
+contract TokenStaking is AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
-
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
@@ -24,8 +21,6 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
     uint256 constant REWARD_INTERVAL = 60 seconds; 
     uint256 constant UNSTAKE_COOLDOWN = 5 minutes; 
 
-
-
     enum UserTier { Bronze, Silver, Gold, Diamond }
 
     struct UserInfo {
@@ -37,7 +32,6 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
         uint256 lockUntil;
         bool hasActiveStake;
     }
-
 
     struct GlobalStats {
         uint256 totalUsers;
@@ -66,16 +60,14 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
     event RoleGrantedCustom(bytes32 indexed role, address indexed account, address indexed sender);
     event RoleRevokedCustom(bytes32 indexed role, address indexed account, address indexed sender);
 
-
-    constructor(address _stakingToken) Ownable(msg.sender) {
+    constructor(address _stakingToken) {
+        require(_stakingToken != address(0), "Invalid token address");
         stakingToken = IERC20(_stakingToken);
-
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender); 
         _grantRole(ADMIN_ROLE, msg.sender);
         _grantRole(AUDITOR_ROLE, msg.sender);
     }
-
 
     function stake(uint256 _amount, uint256 _lockDays) external whenNotPaused nonReentrant {
         require(_amount > 0, "Cannot stake 0 tokens");
@@ -141,7 +133,6 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
         }
 
         emit Unstaked(msg.sender, _amount);
-
         stakingToken.safeTransfer(msg.sender, _amount);
     }
 
@@ -150,24 +141,25 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
         _claimReward(msg.sender);
     }
 
-
     function _claimReward(address _userAddress) internal {
         UserInfo storage user = users[_userAddress];
         
-        uint256 reward = calculateReward(_userAddress);
+        uint256 timePassed = block.timestamp - user.lastClaimTime;
+        uint256 periods = timePassed / REWARD_INTERVAL;
         
-        if (reward > 0) {
-            user.totalRewardsClaimed += reward;
-            stats.totalRewardsPaid += reward;
-            stats.claimOperations++;
+        if (periods > 0) {
+            uint256 reward = calculateReward(_userAddress);
             
-            user.lastClaimTime = block.timestamp;
+            user.lastClaimTime += periods * REWARD_INTERVAL;
 
-            emit RewardClaimed(_userAddress, reward);
+            if (reward > 0) {
+                user.totalRewardsClaimed += reward;
+                stats.totalRewardsPaid += reward;
+                stats.claimOperations++;
 
-            stakingToken.safeTransfer(_userAddress, reward);
-        } else {
-            user.lastClaimTime = block.timestamp;
+                emit RewardClaimed(_userAddress, reward);
+                stakingToken.safeTransfer(_userAddress, reward);
+            }
         }
     }
 
@@ -183,12 +175,12 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
         uint256 baseReward = (user.amount * periods * rewardRate) / 10000;
         UserTier tier = getUserTier(_userAddress);
         uint256 tierMultiplier = 100; 
+        
         if (tier == UserTier.Silver) tierMultiplier = 110; 
         else if (tier == UserTier.Gold) tierMultiplier = 125;   
         else if (tier == UserTier.Diamond) tierMultiplier = 150;
 
         baseReward = (baseReward * tierMultiplier) / 100;
-
 
         uint256 lockMultiplier = 100;
         if (user.lockDuration == 7 days) lockMultiplier = 120;   
@@ -206,7 +198,6 @@ contract TokenStaking is AccessControl, Ownable, Pausable, ReentrancyGuard {
         if (amount >= 100 * 10**18) return UserTier.Silver;
         return UserTier.Bronze;
     }
-
 
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
